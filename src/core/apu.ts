@@ -29,19 +29,40 @@ export const pulseDutyArray = [
     [0, 1, 1, 1, 1, 1, 1, 0],
 ];
 
-const sampleBufMax = 512;
+export const pulseDutyValueArray = Float32Array.from([
+    0.125, 0.25, 0.5, 0.75
+]);
 
 export const noiseDivisors = Uint8Array.from([8, 16, 32, 48, 64, 80, 96, 112]);
 export const waveShiftCodes = Uint8Array.from([4, 0, 1, 2]);
 
-const channelSampleRate = 65536;
+const sampleBufMax = 512;
+const channelSampleRate = 44100;
 const cyclesPerSample = 4194304 / channelSampleRate;
-const outputSampleRate = 65536;
+const outputSampleRate = 44100;
 
-const capacitorChargeFactor = Math.pow(0.999958, 4194304 / 65536);
+const capacitorChargeFactor = Math.pow(0.999958, 4194304 / channelSampleRate);
 
 export const noise7Array: Uint8Array = genNoiseArray(true);
 export const noise15Array: Uint8Array = genNoiseArray(false);
+
+const pulseHarmonics = 12;
+
+const sinLut = generateSineLut();
+
+function generateSineLut(): Float32Array {
+    const entries = 65536;
+    const xPerEntry = (Math.PI * 2) / entries;
+    let array = new Float32Array(entries);
+
+    let x = 0;
+    for (let i = 0; i < entries; i++) {
+        array[i] = Math.sin(x);
+        x += xPerEntry;
+    }
+
+    return array;
+}
 
 function genNoiseArray(sevenBit: boolean): Uint8Array {
     let array = new Uint8Array(65536);
@@ -141,6 +162,7 @@ export class APU {
                 } else {
                     this.ch1.frequency = this.ch1.sweepShadowFrequency;
                     this.ch1.frequencyPeriod = (2048 - this.ch1.frequency) * 4;
+                    this.ch1.frequencyHz = 131072 / (2048 - this.ch1.frequency);
                 }
             }
             this.ch1.sweepTimer--;
@@ -231,6 +253,8 @@ export class APU {
 
         volMulL: 0,
         volMulR: 0,
+
+        synthTime: 0,
         // -------
 
         // NR10
@@ -253,6 +277,7 @@ export class APU {
         useLength: false,
 
         frequencyPeriod: 256,
+        frequencyHz: 0,
 
         updateOut: function () {
             let temp = this.currentVal * this.volume;
@@ -287,6 +312,8 @@ export class APU {
 
         volMulL: 0,
         volMulR: 0,
+
+        synthTime: 0,
         // -------
 
         // NR21
@@ -304,6 +331,7 @@ export class APU {
         useLength: false,
 
         frequencyPeriod: 256,
+        frequencyHz: 0,
 
         updateOut: function () {
             let temp = this.currentVal * this.volume;
@@ -441,6 +469,7 @@ export class APU {
     triggerCh1() {
         this.ch1.frequencyTimer = this.ch1.frequencyPeriod;
         this.ch1.pos = 0;
+        this.ch1.synthTime = 0;
         if (this.ch1.dacEnabled) this.ch1.enabled = true;
         this.ch1.volume = this.ch1.envelopeInitial;
         this.ch1.lengthTimer = 64 - this.ch1.length;
@@ -454,9 +483,11 @@ export class APU {
     triggerCh2() {
         this.ch2.frequencyTimer = this.ch2.frequencyPeriod;
         this.ch2.pos = 0;
+        this.ch2.synthTime = 0;
         if (this.ch2.dacEnabled) this.ch2.enabled = true;
         this.ch2.volume = this.ch2.envelopeInitial;
         this.ch2.lengthTimer = 64 - this.ch2.length;
+
     }
 
     triggerCh3() {
@@ -519,27 +550,20 @@ export class APU {
         let finalL = 0;
         let finalR = 0;
 
-        this.ch1.frequencyTimer -= cyclesPerSample;
-        if (this.ch1.frequencyPeriod != 0) {
-            while (this.ch1.frequencyTimer <= 0) {
-                this.ch1.frequencyTimer += this.ch1.frequencyPeriod;
-                this.advanceCh1();
-            }
-        }
-        finalL += this.ch1.outL;
-        finalR += this.ch1.outR;
-
-        this.ch2.frequencyTimer -= cyclesPerSample;
-        if (this.ch2.frequencyPeriod != 0) {
-            while (this.ch2.frequencyTimer <= 0) {
-                this.ch2.frequencyTimer += this.ch2.frequencyPeriod;
-                this.advanceCh2();
-            }
-        }
-
-        finalL += this.ch2.outL;
-        finalR += this.ch2.outR;
-
+        // this.ch1.frequencyTimer -= cyclesPerSample;
+        // if (this.ch1.frequencyPeriod != 0) {
+        //     while (this.ch1.frequencyTimer <= 0) {
+        //         this.ch1.frequencyTimer += this.ch1.frequencyPeriod;
+        //         this.advanceCh1();
+        //     }
+        // }
+        // this.ch2.frequencyTimer -= cyclesPerSample;
+        // if (this.ch2.frequencyPeriod != 0) {
+        //     while (this.ch2.frequencyTimer <= 0) {
+        //         this.ch2.frequencyTimer += this.ch2.frequencyPeriod;
+        //         this.advanceCh2();
+        //     }
+        // }
         this.ch3.frequencyTimer -= cyclesPerSample;
         if (this.ch3.frequencyPeriod != 0) {
             while (this.ch3.frequencyTimer <= 0) {
@@ -547,21 +571,55 @@ export class APU {
                 this.advanceCh3();
             }
         }
-
-        finalL += this.ch3.outL;
-        finalR += this.ch3.outR;
-
-        // Channel 4 can be advanced far too often to be efficient for the scheduler
+        // Prevent Channel 4 from sounding weird if its frequency is faster than the sample rate
         this.ch4.frequencyTimer -= cyclesPerSample;
+        let sampleTime = 1;
+        let noiseFinalL = this.ch4.outL;
+        let noiseFinalR = this.ch4.outR;
         if (this.ch4.frequencyPeriod != 0) {
             while (this.ch4.frequencyTimer <= 0) {
                 this.ch4.frequencyTimer += this.ch4.frequencyPeriod;
                 this.advanceCh4();
+                sampleTime += 1;
+                noiseFinalL += this.ch4.outL;
+                noiseFinalR += this.ch4.outR;
             }
         }
 
-        finalL += this.ch4.outL;
-        finalR += this.ch4.outR;
+        // finalL += this.ch1.outL;
+        // finalR += this.ch1.outR;
+        // finalL += this.ch2.outL;
+        // finalR += this.ch2.outR;
+        finalL += this.ch3.outL;
+        finalR += this.ch3.outR;
+        finalL += noiseFinalL / sampleTime;
+        finalR += noiseFinalR / sampleTime;
+
+        if (this.ch1.dacEnabled) {
+            if (this.ch1.enabled) {
+                let rawWave = this.samplePulse(pulseDutyValueArray[this.ch1.duty], this.ch1.synthTime, this.ch1.frequencyHz);
+                let val = (((rawWave * 0.5) * this.ch1.volume) / 15) - 1;
+                if (this.ch1.enableL) finalL += val * this.ch1.volMulL;
+                if (this.ch1.enableR) finalR += val * this.ch1.volMulR;
+            } else {
+                if (this.ch1.enableL) finalL -= 1;
+                if (this.ch1.enableR) finalR -= 1;
+            }
+        }
+        if (this.ch2.dacEnabled) {
+            if (this.ch2.enabled) {
+                let rawWave = this.samplePulse(pulseDutyValueArray[this.ch2.duty], this.ch2.synthTime, this.ch2.frequencyHz);
+                let val = (((rawWave * 0.5) * this.ch2.volume) / 15) - 1;
+                if (this.ch2.enableL) finalL += val * this.ch2.volMulL;
+                if (this.ch2.enableR) finalR += val * this.ch2.volMulR;
+            } else {
+                if (this.ch2.enableL) finalL -= 1;
+                if (this.ch2.enableR) finalR -= 1;
+            }
+        }
+
+        this.ch1.synthTime += this.ch1.frequencyHz / 44100;
+        this.ch2.synthTime += this.ch2.frequencyHz / 44100;
 
         let outL = finalL - this.capacitorL;
         let outR = finalR - this.capacitorR;
@@ -586,6 +644,27 @@ export class APU {
 
         this.scheduler.addEventRelative(SchedulerId.APUSample, cyclesPerSample - cyclesLate, this.sample);
     };
+
+    samplePulse(duty: number, time: number, frequencyHz: number) {
+        const PI = Math.PI;
+
+        let sin1 = 0;
+        let sin2 = 0;
+
+        let nyquist = outputSampleRate / 2;
+        let harmonics = Math.floor(nyquist / frequencyHz);
+
+        for (let n = 1; n < harmonics; n++) {
+            let component = n * 65535;
+            sin1 += sinLut[((time - 0) * component) & 65535] / n;
+            sin2 += sinLut[((time - duty) * component) & 65535] / n;
+        }
+
+        // sin1 += sinLut[(time * 65535) & 65535];
+        // sin2 += sinLut[(time * 65535) & 65535];
+
+        return ((sin1 - sin2) + (duty * PI) - (PI / 2)) * 1.275;
+    }
 
     readHwio8(addr: number): number {
         switch (addr) {
@@ -679,6 +758,7 @@ export class APU {
                 this.ch1.frequency |= ((val & 0xFF) << 0);
 
                 this.ch1.frequencyPeriod = (2048 - this.ch1.frequency) * 4;
+                this.ch1.frequencyHz = 131072 / (2048 - this.ch1.frequency);
                 this.ch1.updateOut();
                 break;
             case 0xFF14: // NR14
@@ -688,6 +768,7 @@ export class APU {
                 if (bitTest(val, 7)) this.triggerCh1();
 
                 this.ch1.frequencyPeriod = (2048 - this.ch1.frequency) * 4;
+                this.ch1.frequencyHz = 131072 / (2048 - this.ch1.frequency);
                 this.ch1.updateOut();
                 break;
 
@@ -729,6 +810,7 @@ export class APU {
                 this.ch2.frequency |= ((val & 0xFF) << 0);
 
                 this.ch2.frequencyPeriod = (2048 - this.ch2.frequency) * 4;
+                this.ch2.frequencyHz = 131072 / (2048 - this.ch2.frequency);
                 this.ch2.updateOut();
                 break;
             case 0xFF19: // NR24
@@ -738,6 +820,7 @@ export class APU {
                 if (bitTest(val, 7)) this.triggerCh2();
 
                 this.ch2.frequencyPeriod = (2048 - this.ch2.frequency) * 4;
+                this.ch2.frequencyHz = 131072 / (2048 - this.ch2.frequency);
                 this.ch2.updateOut();
                 break;
 
