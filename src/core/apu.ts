@@ -36,10 +36,10 @@ export const pulseDutyValueArray = Float32Array.from([
 export const noiseDivisors = Uint8Array.from([8, 16, 32, 48, 64, 80, 96, 112]);
 export const waveShiftCodes = Uint8Array.from([4, 0, 1, 2]);
 
-const sampleBufMax = 512;
-const channelSampleRate = 44100;
+const sampleBufMax = 1024;
+const channelSampleRate = 48000;
 const cyclesPerSample = 4194304 / channelSampleRate;
-const outputSampleRate = 44100;
+const outputSampleRate = 48000;
 
 const capacitorChargeFactor = Math.pow(0.999958, 4194304 / channelSampleRate);
 
@@ -573,14 +573,14 @@ export class APU {
         }
         // Prevent Channel 4 from sounding weird if its frequency is faster than the sample rate
         this.ch4.frequencyTimer -= cyclesPerSample;
-        let sampleTime = 1;
+        let samplesTaken = 1;
         let noiseFinalL = this.ch4.outL;
         let noiseFinalR = this.ch4.outR;
         if (this.ch4.frequencyPeriod != 0) {
             while (this.ch4.frequencyTimer <= 0) {
                 this.ch4.frequencyTimer += this.ch4.frequencyPeriod;
                 this.advanceCh4();
-                sampleTime += 1;
+                samplesTaken += 1;
                 noiseFinalL += this.ch4.outL;
                 noiseFinalR += this.ch4.outR;
             }
@@ -592,8 +592,8 @@ export class APU {
         // finalR += this.ch2.outR;
         finalL += this.ch3.outL;
         finalR += this.ch3.outR;
-        finalL += noiseFinalL / sampleTime;
-        finalR += noiseFinalR / sampleTime;
+        finalL += noiseFinalL / samplesTaken;
+        finalR += noiseFinalR / samplesTaken;
 
         if (this.ch1.dacEnabled) {
             if (this.ch1.enabled) {
@@ -618,8 +618,8 @@ export class APU {
             }
         }
 
-        this.ch1.synthTime += this.ch1.frequencyHz / 44100;
-        this.ch2.synthTime += this.ch2.frequencyHz / 44100;
+        this.ch1.synthTime += this.ch1.frequencyHz / outputSampleRate;
+        this.ch2.synthTime += this.ch2.frequencyHz / outputSampleRate;
 
         let outL = finalL - this.capacitorL;
         let outR = finalR - this.capacitorR;
@@ -627,8 +627,8 @@ export class APU {
         this.capacitorL = finalL - outL * capacitorChargeFactor;
         this.capacitorR = finalR - outR * capacitorChargeFactor;
 
-        this.sampleBufL[this.sampleBufPos] = outL;
-        this.sampleBufR[this.sampleBufPos] = outR;
+        this.sampleBufL[this.sampleBufPos] = outL * 0.4;
+        this.sampleBufR[this.sampleBufPos] = outR * 0.4;
         this.sampleBufPos++;
 
         if (this.sampleBufPos >= sampleBufMax) {
@@ -652,7 +652,7 @@ export class APU {
         let sin2 = 0;
 
         let nyquist = outputSampleRate / 2;
-        let harmonics = Math.floor(nyquist / frequencyHz);
+        let harmonics = Math.ceil(nyquist / frequencyHz);
 
         for (let n = 1; n < harmonics; n++) {
             let component = n * 65535;
